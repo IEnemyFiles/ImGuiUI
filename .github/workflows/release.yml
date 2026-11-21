@@ -1,6 +1,6 @@
 # Builds every backend and publishes them as a GitHub Release.
 #   push a tag "v*"           -> release named after the tag
-#   push to master            -> rolling "latest" release (replaced each time, marked as the repo's latest release)
+#   push to main              -> rolling "latest" release (replaced each time, marked as the repo's latest release)
 #   run manually (Actions tab) -> same as master
 name: Build & Release
 
@@ -40,9 +40,13 @@ jobs:
           python3 tools/minify.py dist/roblox/ImGui.luau dist/ImGui.min.luau
           python3 tools/minify.py dist/love/imgui_love.lua dist/imgui_love.min.lua
 
+      - name: Sync generated README
+        run: |
+          python3 tools/sync_github_readme.py
+          python3 tools/sync_github_readme.py --check
+
       - name: Check
         run: |
-          python3 tools/sync_github_readme.py --check
           luau-compile --null dist/roblox/ImGui.luau
           luau-compile --null dist/roblox/ImGuiWorker.client.luau
           ! grep -n "require" dist/roblox/ImGuiWorker.client.luau   # parallel worker: self-contained (worker.luau + raster.lua inlined)
@@ -120,3 +124,4 @@ jobs:
           gh release create latest --latest --title "Latest build (${GITHUB_SHA::7})" \
             --notes "Automatic build of ${GITHUB_SHA} on ${GITHUB_REF_NAME}. Tag a commit v* for a versioned release." \
             dist/ImGui.luau dist/ImGuiWorker.client.luau dist/imgui_love.lua dist/*.min.luau dist/*.min.lua dist/*.zip
+            
