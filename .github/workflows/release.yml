@@ -1,0 +1,122 @@
+# Builds every backend and publishes them as a GitHub Release.
+#   push a tag "v*"           -> release named after the tag
+#   push to master            -> rolling "latest" release (replaced each time, marked as the repo's latest release)
+#   run manually (Actions tab) -> same as master
+name: Build & Release
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install Luau and LuaJIT (for checks)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq luajit
+          curl -fsSL -o luau.zip https://github.com/luau-lang/luau/releases/latest/download/luau-ubuntu.zip
+          unzip -q luau.zip -d luau && chmod +x luau/* && echo "$PWD/luau" >> "$GITHUB_PATH"
+
+      - name: Build
+        env:
+          IMGUI_BUNDLE_STRICT: "1" # fail if enum folding (needs the luau CLI above) can't run
+        run: |
+          mkdir -p dist
+          python3 tools/bundle.py dist/roblox                       # ImGui.luau (library + demo), ImGuiTyped.luau, ImGuiWorker.client.luau
+          python3 tools/bundle.py --target love dist/love             # imgui_love.lua (library + demo)
+          # minified variants (comments/whitespace stripped, same code): tools/minify.py
+          python3 tools/minify.py dist/roblox/ImGui.luau dist/ImGui.min.luau
+          python3 tools/minify.py dist/love/imgui_love.lua dist/imgui_love.min.lua
+
+      - name: Check
+        run: |
+          python3 tools/sync_github_readme.py --check
+          luau-compile --null dist/roblox/ImGui.luau
+          luau-compile --null dist/roblox/ImGuiWorker.client.luau
+          ! grep -n "require" dist/roblox/ImGuiWorker.client.luau   # parallel worker: self-contained (worker.luau + raster.lua inlined)
+          sed 's|require(script:WaitForChild("Impl"))|nil|' dist/roblox/ImGuiTyped.luau > /tmp/ImGuiTyped.luau && luau-analyze /tmp/ImGuiTyped.luau
+          luajit -bl dist/love/imgui_love.lua > /dev/null
+          python3 tools/minify.py --test
+          luau-compile --null dist/ImGui.min.luau
+          luajit -bl dist/imgui_love.min.lua > /dev/null
+          python3 tools/test/run.py --main tools/test/scripts/t_readme.luau --frames 30 --quiet --roblox --timeout 300 | tee /tmp/r.txt
+          grep -q "README OK" /tmp/r.txt
+          python3 tools/test/run.py --main tools/test/scripts/t_cached_window.luau --frames 130 --quiet --roblox --timeout 300 | tee /tmp/c.txt
+          grep -q "CACHED OK" /tmp/c.txt
+          MINIFY=1 python3 tools/test/run.py --main tools/test/scripts/t_readme.luau --frames 30 --quiet --roblox --timeout 300 | tee /tmp/rm.txt
+          grep -q "README OK" /tmp/rm.txt
+          python3 tools/test/run.py --main tools/test/scripts/t_fixes.luau --frames 55 --quiet --roblox --timeout 300 | tee /tmp/f.txt
+          grep -q "FIXES OK" /tmp/f.txt
+          python3 tools/bundle.py --target love >/dev/null
+          luajit tools/test/love/t_drawhash.lua 60 Widgets,Basic | tee /tmp/h.txt
+          cp build/imgui_love.lua /tmp/imgui_love.lua && cp dist/imgui_love.min.lua build/imgui_love.lua
+          luajit tools/test/love/t_drawhash.lua 60 Widgets,Basic | tee /tmp/hm.txt
+          cp /tmp/imgui_love.lua build/imgui_love.lua
+          diff /tmp/h.txt /tmp/hm.txt   # minified LÖVE bundle draws exactly the same
+          luajit tools/test/love/t_examples.lua
+
+      - name: Package
+        run: |
+          V="${GITHUB_REF_NAME}"
+          cd dist
+          cp roblox/ImGui.luau ImGui.luau
+          cp love/imgui_love.lua imgui_love.lua
+          cp roblox/ImGuiWorker.client.luau ImGuiWorker.client.luau
+          # Roblox: module + example LocalScript + Rojo project
+          mkdir -p pkg-roblox/build && cp ImGui.luau roblox/ImGuiTyped.luau ImGuiWorker.client.luau pkg-roblox/build/ && cp ../default.project.json pkg-roblox/
+          mkdir -p pkg-roblox/examples && cp -r ../examples/example_roblox ../examples/example_roblox_parallel pkg-roblox/examples/
+          (cd pkg-roblox && zip -qr ../imgui-luau-roblox-$V.zip .)
+          # LÖVE: bundle + fonts + examples (run: love examples/example_love)
+          mkdir -p pkg-love/build && cp imgui_love.lua pkg-love/build/ && cp -r ../fonts pkg-love/ && rm -f pkg-love/fonts/*.lua
+          mkdir -p pkg-love/examples && cp -r ../examples/example_love pkg-love/examples/
+          (cd pkg-love && zip -qr ../imgui-luau-love-$V.zip .)
+          ls -la
+
+      - name: Release (tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/ImGui.luau
+            dist/ImGuiWorker.client.luau
+            dist/imgui_love.lua
+            dist/*.min.luau
+            dist/*.min.lua
+            dist/*.zip
+          generate_release_notes: true
+
+      - name: Publish to Wally (tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          WALLY_TOKEN: ${{ secrets.WALLY_TOKEN }}
+        run: |
+          [ -n "$WALLY_TOKEN" ] || { echo "WALLY_TOKEN not set, skipping"; exit 0; }
+          grep -q "^version = \"${GITHUB_REF_NAME#v}\"" wally.toml || { echo "wally.toml version != tag"; exit 1; }
+          curl -fsSL -o wally.zip https://github.com/UpliftGames/wally/releases/download/v0.3.2/wally-v0.3.2-linux.zip
+          unzip -q wally.zip -d wallybin && chmod +x wallybin/wally
+          mkdir -p dist/wally/src && cp wally.toml dist/wally/ && cp dist/roblox/ImGuiTyped.luau dist/wally/src/init.luau && cp dist/roblox/ImGui.luau dist/wally/src/Impl.luau && cp dist/roblox/ImGuiWorker.client.luau dist/wally/src/Worker.client.luau
+          echo '{"name":"imgui-luau","tree":{"$path":"src"}}' > dist/wally/default.project.json
+          wallybin/wally login --token "$WALLY_TOKEN"
+          wallybin/wally publish --project-path dist/wally
+
+      - name: Release (latest)
+        if: "!startsWith(github.ref, 'refs/tags/v')"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest --latest --title "Latest build (${GITHUB_SHA::7})" \
+            --notes "Automatic build of ${GITHUB_SHA} on ${GITHUB_REF_NAME}. Tag a commit v* for a versioned release." \
+            dist/ImGui.luau dist/ImGuiWorker.client.luau dist/imgui_love.lua dist/*.min.luau dist/*.min.lua dist/*.zip
