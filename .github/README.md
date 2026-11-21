@@ -1,5 +1,5 @@
 > [!NOTE]
-> This is a read-only mirror of **https://git.bug.tools/bug/imgui-luau**. Releases are built here by GitHub Actions; development happens on git.bug.tools.
+> This is a read-only mirror of **https://github.com/IEnemyFiles/imguiUI**. Releases are built here by GitHub Actions; development happens on [ImGuiUI](https://github.com/IEnemyFiles/imguiUI).
 
 Dear ImGui for Roblox (and more)
 =====
