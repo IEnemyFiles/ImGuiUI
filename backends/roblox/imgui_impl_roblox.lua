@@ -9,6 +9,7 @@ local Patches = IM_INCLUDE("roblox/patches.lua")
 
 local UserInputService = game:GetService("UserInputService")
 local Players          = game:GetService("Players")
+local GuiService       = game:GetService("GuiService")
 
 local floor, min = math.floor, math.min
 local EditableImages, PB, PE = Textures.EditableImages, Textures.PB, Textures.PE
@@ -84,6 +85,173 @@ local function ImGui_ImplRoblox_UpdateMonitors(w, h)
     platform_io.Monitors:push_back(imgui_monitor)
 end
 
+
+---------------------------------------------------------
+-- TOUCH (phones / tablets)
+-- One finger   = left mouse button (ImGuiMouseSource.TouchScreen: no hover before the press, hover cleared on lift).
+-- Long press   = right click (context menus, InputText cut/copy/paste). The pending left press is cancelled silently.
+-- Two fingers  = pan: mouse wheel events (vertical + horizontal), so windows / child regions / tables scroll.
+-- Soft keyboard: SetTextProxy(true) (enabled automatically on touch-only devices) captures focus of a hidden TextBox.
+---------------------------------------------------------
+local LONG_PRESS_TIME = 0.5 -- seconds a finger must stay still to count as a right click
+local TAP_SLOP        = 10  -- UI points a finger may wander before the press stops being a "tap"
+
+-- Input position (inset-adjusted) -> imgui pixels. The ScreenGui ignores the GUI inset, so add it back.
+local function TouchPosition(BackendData, input)
+    local inset = GuiService:GetGuiInset()
+    local scale = BackendData.Scale
+    return (input.Position.X + inset.X) * scale, (input.Position.Y + inset.Y) * scale
+end
+
+-- Does imgui have a window under this point? (the touch equivalent of io.WantCaptureMouse, usable before the press)
+local function TouchHitsImGui(x, y)
+    local g = ImGui.GetCurrentContext()
+    if not g then return false end
+    local pos, pad = ImVec2(x, y), g.Style.TouchExtraPadding
+    for i = g.Windows.Size, 1, -1 do
+        local w = g.Windows.Data[i]
+        if w.WasActive and not w.Hidden and bit32.band(w.Flags, ImGuiWindowFlags.NoMouseInputs) == 0
+            and w.OuterRectClipped:ContainsWithPad(pos, pad) then
+            return true
+        end
+    end
+    return false
+end
+
+local function TouchNewState()
+    return {
+        Points = {}, Count = 0,
+        Mode = "none",              -- none | tap | held (long press fired) | scroll | ignore (leftover finger after a pan)
+        LeftDown = false, RightDown = false,
+        StartX = 0, StartY = 0, StartTime = 0, Moved = false, OverUI = false,
+        CX = 0, CY = 0,             -- pan centroid (previous)
+        WheelX = 0, WheelY = 0,
+        LongPress = LONG_PRESS_TIME, -- nil / false disables the long press
+        Scroll = true,              -- two finger pan -> wheel
+        BlockGame = false,          -- keep tiles Active so Roblox never forwards touches on imgui to the game
+    }
+end
+
+local function TouchCentroid(T)
+    local sx, sy, n = 0, 0, 0
+    for _, p in pairs(T.Points) do sx += p.X; sy += p.Y; n += 1 end
+    return sx / n, sy / n
+end
+
+-- Drop whatever mouse state the touch created without clicking anything: move out first (a released button only
+-- counts as a click while hovered), then release. Trickling spreads the events over a few frames.
+local function TouchCancelButtons(T, io)
+    if T.LeftDown or T.RightDown then
+        io:AddMouseSourceEvent(ImGuiMouseSource.TouchScreen)
+        io:AddMousePosEvent(-FLT_MAX, -FLT_MAX)
+        if T.LeftDown then io:AddMouseButtonEvent(0, false) end
+        if T.RightDown then io:AddMouseButtonEvent(1, false) end
+        T.LeftDown, T.RightDown = false, false
+    end
+end
+
+local function TouchBegan(BackendData, input)
+    local T, io = BackendData.Touch, ImGui.GetIO()
+    local x, y = TouchPosition(BackendData, input)
+    if T.Points[input] then return end
+    T.Points[input] = { X = x, Y = y }
+    T.Count += 1
+    if T.Count == 1 then
+        T.Mode, T.StartX, T.StartY, T.StartTime, T.Moved = "tap", x, y, os.clock(), false
+        T.OverUI = TouchHitsImGui(x, y)
+        io:AddMouseSourceEvent(ImGuiMouseSource.TouchScreen)
+        io:AddMousePosEvent(x, y)
+        io:AddMouseButtonEvent(0, true)
+        T.LeftDown = true
+    elseif T.Mode ~= "scroll" then -- second finger: the first one was not a click after all
+        TouchCancelButtons(T, io)
+        T.Mode = T.Scroll and "scroll" or "ignore"
+    end
+    if T.Mode == "scroll" then
+        T.CX, T.CY = TouchCentroid(T)
+        io:AddMouseSourceEvent(ImGuiMouseSource.TouchScreen)
+        io:AddMousePosEvent(T.CX, T.CY) -- wheel events go to the window under the pan
+    end
+end
+
+local function TouchChanged(BackendData, input)
+    local T, io = BackendData.Touch, ImGui.GetIO()
+    local p = T.Points[input]
+    if not p then return end
+    local x, y = TouchPosition(BackendData, input)
+    p.X, p.Y = x, y
+    local mode = T.Mode
+    if mode == "tap" or mode == "held" then
+        if not T.Moved then
+            local dx, dy = x - T.StartX, y - T.StartY
+            local slop = TAP_SLOP * BackendData.Scale
+            if dx * dx + dy * dy > slop * slop then T.Moved = true end
+        end
+        io:AddMouseSourceEvent(ImGuiMouseSource.TouchScreen)
+        io:AddMousePosEvent(x, y)
+    elseif mode == "scroll" then
+        local cx, cy = TouchCentroid(T)
+        local g = ImGui.GetCurrentContext()
+        local font_px = (g and g.FontSize > 0) and g.FontSize or 13
+        -- one wheel notch scrolls ~5 lines of text: dragging content with the fingers = wheel in the drag direction
+        T.WheelX += (cx - T.CX) / (5 * font_px)
+        T.WheelY += (cy - T.CY) / (5 * font_px)
+        T.CX, T.CY = cx, cy
+        io:AddMouseSourceEvent(ImGuiMouseSource.TouchScreen)
+        io:AddMousePosEvent(cx, cy)
+        if T.WheelX ~= 0 or T.WheelY ~= 0 then
+            io:AddMouseWheelEvent(T.WheelX, T.WheelY)
+            T.WheelX, T.WheelY = 0, 0
+        end
+    end
+end
+
+local function TouchEnded(BackendData, input)
+    local T, io = BackendData.Touch, ImGui.GetIO()
+    local p = T.Points[input]
+    if not p then return end
+    local x, y = TouchPosition(BackendData, input)
+    T.Points[input] = nil
+    T.Count -= 1
+    io:AddMouseSourceEvent(ImGuiMouseSource.TouchScreen)
+    if T.Count == 0 then
+        local mode = T.Mode
+        T.Mode = "none"
+        if mode == "tap" then
+            io:AddMousePosEvent(x, y)
+            io:AddMouseButtonEvent(0, false)
+            T.LeftDown = false
+        elseif mode == "held" and T.RightDown then
+            io:AddMouseButtonEvent(1, false)
+            T.RightDown = false
+        end
+        -- no finger = no hover (tooltips, highlights); the next mouse movement brings the real position back
+        io:AddMousePosEvent(-FLT_MAX, -FLT_MAX)
+        BackendData.MouseX, BackendData.MouseY = nil, nil
+    elseif T.Mode == "scroll" and T.Count < 2 then
+        T.Mode = "ignore" -- the remaining finger must not turn into a click / jump
+    elseif T.Mode == "scroll" then
+        T.CX, T.CY = TouchCentroid(T)
+    end
+end
+
+-- Per frame: long press -> right click
+local function TouchUpdate(BackendData, io, now)
+    local T = BackendData.Touch
+    if T.Mode ~= "tap" or T.Moved or not T.LongPress then return end
+    if now - T.StartTime < T.LongPress or not (T.OverUI or io.WantCaptureMouse) then return end
+    T.Mode = "held"
+    -- cancel the left press without a click, then right button down + up at the same spot (a context menu opens on
+    -- the release)
+    io:AddMouseSourceEvent(ImGuiMouseSource.TouchScreen)
+    io:AddMousePosEvent(-FLT_MAX, -FLT_MAX)
+    io:AddMouseButtonEvent(0, false)
+    io:AddMousePosEvent(T.StartX, T.StartY)
+    io:AddMouseButtonEvent(1, true)
+    io:AddMouseButtonEvent(1, false)
+    T.LeftDown, T.RightDown = false, false
+end
+
 -- Games can't touch the OS clipboard, so copy/paste only works inside ImGui
 local Clipboard = ""
 local function ImGui_ImplRoblox_PlatformSetClipboardText(ctx, text) Clipboard = text end
@@ -141,7 +309,10 @@ function ImGui_ImplRoblox_Init(parent, render_scale)
         Layers = {}, Overlays = {}, OverlayHolders = {}, OverlayShown = {}, FrameNo = 0, Scale = render_scale or 1,
             TilesActive = false, RenderRate = 60, BusyRenderRate = 0, RedrawBudget = 0, HeartbeatCount = 0,
             NextRender = 0, LastCmdCount = 0, ForceRedraw = true,
+            Touch = TouchNewState(),
+            TouchOnly = UserInputService.TouchEnabled and not UserInputService.MouseEnabled, -- phone / tablet
     }
+    BackendData.Touch.BlockGame = BackendData.TouchOnly
     io.BackendPlatformUserData = BackendData
     EditableImages.Backends[BackendData] = true
     io.BackendPlatformName = "imgui_impl_roblox"
@@ -165,6 +336,8 @@ function ImGui_ImplRoblox_Init(parent, render_scale)
         if button then
             io:AddMouseSourceEvent(ImGuiMouseSource.Mouse)
             io:AddMouseButtonEvent(button, true)
+        elseif input.UserInputType == Enum.UserInputType.Touch then
+            TouchBegan(BackendData, input) -- (game_processed is true over Active tiles: touches are used either way)
         elseif input.UserInputType == Enum.UserInputType.Keyboard and (not game_processed or ProxyFocused) then
             local ctrl, shift, alt = ImGui_ImplRoblox_UpdateKeyModifiers()
             local key = KEY_MAP[input.KeyCode]
@@ -189,6 +362,8 @@ function ImGui_ImplRoblox_Init(parent, render_scale)
         local button = MOUSE_BUTTONS[input.UserInputType]
         if button then
             io:AddMouseButtonEvent(button, false)
+        elseif input.UserInputType == Enum.UserInputType.Touch then
+            TouchEnded(BackendData, input)
         elseif input.UserInputType == Enum.UserInputType.Keyboard then
             ImGui_ImplRoblox_UpdateKeyModifiers()
             local key = KEY_MAP[input.KeyCode]
@@ -199,6 +374,8 @@ function ImGui_ImplRoblox_Init(parent, render_scale)
     connect(UserInputService.InputChanged, function(input, game_processed)
         if input.UserInputType == Enum.UserInputType.MouseWheel then
             ImGui.GetIO():AddMouseWheelEvent(0, input.Position.Z)
+        elseif input.UserInputType == Enum.UserInputType.Touch then
+            TouchChanged(BackendData, input)
         end
     end)
 
@@ -227,6 +404,9 @@ function ImGui_ImplRoblox_Init(parent, render_scale)
         ImGui.GetIO():AddFocusEvent(false)
         BackendData.MouseX, BackendData.MouseY = nil, nil
     end)
+
+    -- Touch-only devices have no hardware keyboard: the hidden TextBox is what brings up the on-screen keyboard
+    if BackendData.TouchOnly and not UserInputService.KeyboardEnabled then ImGui_ImplRoblox_SetTextProxy(true) end
 end
 
 -- Text proxy (opt-in): a hidden TextBox holds focus while a text field is active (OS typing, paste, copy/cut)
@@ -258,7 +438,8 @@ function ImGui_ImplRoblox_SetTextProxy(enabled)
     proxy.FocusLost:Connect(function()
         if BackendData.ProxyReleasing then return end
         -- Roblox drops TextBox focus on any click, also inside imgui: only a click outside imgui ends the edit
-        if ImGui.GetIO().WantCaptureMouse then
+        local T = BackendData.Touch
+        if ImGui.GetIO().WantCaptureMouse or (T.Count > 0 and T.OverUI) then
             BackendData.ProxyLostId = nil
             return
         end
@@ -312,8 +493,12 @@ function ImGui_ImplRoblox_NewFrame()
     io.DeltaTime = (current_time > BackendData.Time) and (current_time - BackendData.Time) or (1.0 / 60.0)
     BackendData.Time = current_time
 
-    local m = UserInputService:GetMouseLocation()
-    if m.X ~= BackendData.MouseX or m.Y ~= BackendData.MouseY then
+    local touch = BackendData.Touch
+    TouchUpdate(BackendData, io, current_time)
+    -- a phone has no mouse: GetMouseLocation() there is stale (it would fight the touch position); hybrids poll it
+    -- again once the fingers are up
+    local m = (not BackendData.TouchOnly and touch.Count == 0) and UserInputService:GetMouseLocation() or nil
+    if m and (m.X ~= BackendData.MouseX or m.Y ~= BackendData.MouseY) then
         BackendData.MouseX, BackendData.MouseY = m.X, m.Y
         io:AddMouseSourceEvent(ImGuiMouseSource.Mouse)
         io:AddMousePosEvent(m.X * BackendData.Scale, m.Y * BackendData.Scale)
@@ -408,7 +593,8 @@ function ImGui_ImplRoblox_NewFrame()
     end
 
     -- Tiles Active while over imgui, so Roblox stops passing clicks/wheel to the game (camera zoom etc.)
-    local want = io.WantCaptureMouse
+    -- (phones: always, a touch has no hover to announce itself before it starts; hybrids: while a finger is on a window)
+    local want = io.WantCaptureMouse or (touch.BlockGame and (BackendData.TouchOnly or (touch.Count > 0 and touch.OverUI)))
     if want ~= BackendData.TilesActive then
         BackendData.TilesActive = want
         for _, set in pairs(BackendData.Layers) do
@@ -433,6 +619,39 @@ end
 function ImGui_ImplRoblox_SetBusyRenderRate(hz)
     ImGui_ImplRoblox_GetBackendData().BusyRenderRate = hz or 0
 end
+
+-- Touch options: { LongPress = seconds | false (right click on long press, default 0.5), Scroll = bool (two finger pan
+-- scrolls, default true), BlockGame = bool (default true on phones/tablets: imgui tiles always swallow touches so the
+-- game's camera / thumbstick doesn't react to a tap on a window; false = only while a window is under the finger) }
+function ImGui_ImplRoblox_SetTouchOptions(opts)
+    local T = ImGui_ImplRoblox_GetBackendData().Touch
+    if opts.LongPress ~= nil then T.LongPress = opts.LongPress end
+    if opts.Scroll ~= nil then T.Scroll = opts.Scroll end
+    if opts.BlockGame ~= nil then T.BlockGame = opts.BlockGame end
+end
+
+-- Finger sized UI: bigger hit areas / grabs, and optionally everything larger (`scale` multiplies sizes AND fonts,
+-- default 1). Call once at startup after your own style setup. Also moves windows only by their title bar, so a finger
+-- on content is never a window drag.
+function ImGui_ImplRoblox_SetupTouchStyle(scale, extra_padding)
+    scale = scale or 1
+    local style, io = ImGui.GetStyle(), ImGui.GetIO()
+    if scale ~= 1 then
+        style:ScaleAllSizes(scale)
+        style.FontScaleMain = scale
+    end
+    local e = (extra_padding or 6) * scale
+    style.TouchExtraPadding = ImVec2(e, e)
+    style.ScrollbarSize = math.max(style.ScrollbarSize, 20 * scale)
+    style.GrabMinSize = math.max(style.GrabMinSize, 20 * scale)
+    style.FramePadding = ImVec2(math.max(style.FramePadding.x, 8 * scale), math.max(style.FramePadding.y, 6 * scale))
+    style.ItemSpacing = ImVec2(math.max(style.ItemSpacing.x, 8 * scale), math.max(style.ItemSpacing.y, 8 * scale))
+    io.ConfigWindowsMoveFromTitleBarOnly = true
+    io.ConfigWindowsResizeFromEdges = false -- the resize grip in the corner stays, fingers can't hit 1-2px borders
+end
+
+-- true on phones / tablets (touch screen, no mouse)
+function ImGui_ImplRoblox_IsTouchDevice() return UserInputService.TouchEnabled and not UserInputService.MouseEnabled end
 
 function ImGui_ImplRoblox_SetProfiling(enabled) Textures.SetProfiling(enabled) end
 local ImGui_ImplRoblox_IsProfiling = Textures.IsProfiling
@@ -488,6 +707,9 @@ ImGui_ImplRoblox = {
     DestroyTexture = ImGui_ImplRoblox_DestroyTexture,
     SetOverlay     = ImGui_ImplRoblox_SetOverlay,
     SetTextProxy   = ImGui_ImplRoblox_SetTextProxy,
+    SetTouchOptions = ImGui_ImplRoblox_SetTouchOptions,
+    SetupTouchStyle = ImGui_ImplRoblox_SetupTouchStyle,
+    IsTouchDevice  = ImGui_ImplRoblox_IsTouchDevice,
     SetRenderScale = ImGui_ImplRoblox_SetRenderScale,
     GetRenderScale = function() return ImGui_ImplRoblox_GetBackendData().Scale end,
     SetRenderRate  = ImGui_ImplRoblox_SetRenderRate,

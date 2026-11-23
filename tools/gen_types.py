@@ -124,6 +124,9 @@ IMPL_SIGS = {  # backend functions with exact types; the rest of ImGui_ImplRoblo
     "DisableParallel": "() -> ()", "FinishParallel": "() -> ()", "BeginParallelFrame": "() -> ()",
     "GetParallelStats": "() -> { [string]: number }",
     "GetParallelConfig": "() -> ImGuiParallelConfig",
+    "SetTouchOptions": "(opts: { LongPress: (number | boolean)?, Scroll: boolean?, BlockGame: boolean? }) -> ()",
+    "SetupTouchStyle": "(scale: number?, extra_padding: number?) -> ()",
+    "IsTouchDevice": "() -> boolean",
 }
 
 def impl_type(files):

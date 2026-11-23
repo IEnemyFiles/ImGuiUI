@@ -14,6 +14,7 @@ function love.load()
     io.ConfigFlags = bit32.bor(io.ConfigFlags, G.ImGuiConfigFlags.NavEnableKeyboard, G.ImGuiConfigFlags.DockingEnable)
     io.IniFilename = nil
     G.ImGui_ImplLove.Init({ root = ROOT })
+    if G.ImGui_ImplLove.IsMobile() then G.ImGui_ImplLove.SetupTouchStyle() end -- bigger widgets / fonts for fingers
     io.Fonts:AddFontDefault()
     io.Fonts:AddFontFromFileTTF("fonts/Roboto-Medium.ttf", 16.0)
 end
@@ -52,9 +53,13 @@ function love.draw()
     G.ImGui_ImplLove.RenderDrawData(ImGui.GetDrawData())
 end
 
-function love.mousemoved(x, y) G.ImGui_ImplLove.MouseMoved(x, y) end
-function love.mousepressed(x, y, b) G.ImGui_ImplLove.MousePressed(x, y, b) end
-function love.mousereleased(x, y, b) G.ImGui_ImplLove.MouseReleased(x, y, b) end
+function love.mousemoved(x, y, dx, dy, istouch) G.ImGui_ImplLove.MouseMoved(x, y, dx, dy, istouch) end
+function love.mousepressed(x, y, b, istouch) G.ImGui_ImplLove.MousePressed(x, y, b, istouch) end
+function love.mousereleased(x, y, b, istouch) G.ImGui_ImplLove.MouseReleased(x, y, b, istouch) end
+-- touch screens (Android / iOS): one finger = click, long press = right click, two fingers = scroll
+function love.touchpressed(id, x, y) G.ImGui_ImplLove.TouchPressed(id, x, y) end
+function love.touchmoved(id, x, y) G.ImGui_ImplLove.TouchMoved(id, x, y) end
+function love.touchreleased(id, x, y) G.ImGui_ImplLove.TouchReleased(id, x, y) end
 function love.wheelmoved(x, y) G.ImGui_ImplLove.WheelMoved(x, y) end
 function love.keypressed(k) G.ImGui_ImplLove.KeyPressed(k) end
 function love.keyreleased(k) G.ImGui_ImplLove.KeyReleased(k) end

@@ -159,6 +159,10 @@ ImGui_ImplRoblox.SetRenderRate(RenderRate)
 -- ImGui_ImplRoblox.SetBusyRenderRate(30) -- Optional: lower redraw rate while scrolling/resizing/moving windows
 -- ImGui_ImplRoblox.SetProfiling(true)    -- MicroProfiler labels; turn off when not profiling
 -- ImGui_ImplRoblox.SetTextProxy(true)     -- Optional: hidden TextBox for OS typing (any layout), paste and copy/cut
+-- Phones / tablets: one finger = click, long press = right click, two fingers = scroll, soft keyboard for text fields
+if ImGui_ImplRoblox.IsTouchDevice() then
+	ImGui_ImplRoblox.SetupTouchStyle(1.25) -- finger sized widgets (scale, optional extra hit padding)
+end
 
 local function ProfileBegin(Name)
 	if ImGui_ImplRoblox.IsProfiling() then

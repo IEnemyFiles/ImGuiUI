@@ -1,10 +1,10 @@
 [package]
-name = "4dbug/imgui-luau"
+name = "IEnemyFiles/ImGuiUI"
 version = "0.4.4"
 registry = "https://github.com/UpliftGames/wally-index"
 realm = "shared"
 license = "MIT"
 description = "Dear ImGui (docking branch) ported to Luau for Roblox"
-repository = "https://github.com/4DBug/imgui-luau"
+repository = "https://github.com/IEnemyFiles/ImGuiUI"
 
 [dependencies]

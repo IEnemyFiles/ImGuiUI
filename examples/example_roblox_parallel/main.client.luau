@@ -119,6 +119,7 @@ for _, Name in { "Cousine-Regular", "DroidSans", "Karla-Regular", "ProggyTiny", 
 end
 
 ImGui_ImplRoblox.Init()
+if ImGui_ImplRoblox.IsTouchDevice() then ImGui_ImplRoblox.SetupTouchStyle(1.25) end -- phones / tablets: finger sized widgets
 local RenderRate = 60 -- UI redraws per second (0 = every frame)
 ImGui_ImplRoblox.SetRenderRate(RenderRate)
 ImGui_ImplRoblox.EnableParallel({ Actors = 4 })

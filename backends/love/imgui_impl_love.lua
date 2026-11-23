@@ -5,6 +5,10 @@
 ---   love.update: ImGui_ImplLove.NewFrame(); ImGui.NewFrame(); ...your UI...; ImGui.Render()
 ---   love.draw:  ImGui_ImplLove.RenderDrawData(ImGui.GetDrawData())
 ---   forward love.mousemoved/mousepressed/mousereleased/wheelmoved/keypressed/keyreleased/textinput to ImGui_ImplLove.*
+---   touch (Android / iOS / touch screens): also forward love.touchpressed/touchmoved/touchreleased, and pass `istouch` as
+---   the 4th argument of MousePressed / MouseMoved (LÖVE reports the first finger as a mouse too: those events are ignored
+---   here, the touch callbacks are used instead). Call ImGui_ImplLove.SetupTouchStyle() once for finger sized widgets.
+---   One finger = left button, long press = right click, two fingers = scroll. The soft keyboard opens for text fields.
 
 -- [SECTION] COMPAT (Luau stdlib for LuaJIT). tools/bundle.py --target love runs this section before the library.
 --@compat-begin
@@ -205,6 +209,196 @@ local function UpdateMonitors(w, h)
     ImVec2_Copy(m.MainSize, ImVec2(w, h))
     ImVec2_Copy(m.WorkSize, ImVec2(w, h))
     platform_io.Monitors:push_back(m)
+end
+
+
+---------------------------------------------------------
+-- TOUCH (Android / iOS / touch screens)
+-- One finger   = left mouse button (ImGuiMouseSource.TouchScreen: no hover before the press, hover cleared on lift).
+-- Long press   = right click (context menus, InputText cut/copy/paste). The pending left press is cancelled silently.
+-- Two fingers  = pan: mouse wheel events (vertical + horizontal), so windows / child regions / tables scroll.
+-- Soft keyboard: PlatformSetImeData -> love.keyboard.setTextInput(true) while a text field is active.
+---------------------------------------------------------
+local LONG_PRESS_TIME = 0.5 -- seconds a finger must stay still to count as a right click
+local TAP_SLOP        = 10  -- pixels a finger may wander before the press stops being a "tap"
+
+local function NewTouchState()
+    return {
+        Points = {}, Count = 0,
+        Mode = "none",              -- none | tap | held (long press fired) | scroll | ignore (leftover finger after a pan)
+        LeftDown = false, RightDown = false,
+        StartX = 0, StartY = 0, StartTime = 0, Moved = false, OverUI = false,
+        CX = 0, CY = 0,             -- pan centroid (previous)
+        LongPress = LONG_PRESS_TIME, -- nil / false disables the long press
+        Scroll = true,              -- two finger pan -> wheel
+    }
+end
+
+-- Does imgui have a window under this point? (usable before the press has been processed)
+local function TouchHitsImGui(x, y)
+    local g = ImGui.GetCurrentContext()
+    if not g then return false end
+    local pos, pad = ImVec2(x, y), g.Style.TouchExtraPadding
+    for i = g.Windows.Size, 1, -1 do
+        local w = g.Windows.Data[i]
+        if w.WasActive and not w.Hidden and bit32.band(w.Flags, ImGuiWindowFlags.NoMouseInputs) == 0
+            and w.OuterRectClipped:ContainsWithPad(pos, pad) then
+            return true
+        end
+    end
+    return false
+end
+
+local function TouchCentroid(T)
+    local sx, sy, n = 0, 0, 0
+    for _, p in pairs(T.Points) do sx = sx + p.X; sy = sy + p.Y; n = n + 1 end
+    return sx / n, sy / n
+end
+
+-- Drop whatever mouse state the touch created without clicking anything: move out first (a released button only
+-- counts as a click while hovered), then release. Trickling spreads the events over a few frames.
+local function TouchCancelButtons(T, io)
+    if T.LeftDown or T.RightDown then
+        io:AddMouseSourceEvent(ImGuiMouseSource.TouchScreen)
+        io:AddMousePosEvent(-FLT_MAX, -FLT_MAX)
+        if T.LeftDown then io:AddMouseButtonEvent(0, false) end
+        if T.RightDown then io:AddMouseButtonEvent(1, false) end
+        T.LeftDown, T.RightDown = false, false
+    end
+end
+
+local function TouchPressed(id, x, y)
+    local bd = ImGui_ImplLOVE_GetBackendData()
+    local T, io = bd.Touch, ImGui.GetIO()
+    if T.Points[id] then return end
+    T.Points[id] = { X = x, Y = y }
+    T.Count = T.Count + 1
+    if T.Count == 1 then
+        T.Mode, T.StartX, T.StartY, T.StartTime, T.Moved = "tap", x, y, love.timer.getTime(), false
+        T.OverUI = TouchHitsImGui(x, y)
+        io:AddMouseSourceEvent(ImGuiMouseSource.TouchScreen)
+        io:AddMousePosEvent(x, y)
+        io:AddMouseButtonEvent(0, true)
+        T.LeftDown = true
+    elseif T.Mode ~= "scroll" then -- second finger: the first one was not a click after all
+        TouchCancelButtons(T, io)
+        T.Mode = T.Scroll and "scroll" or "ignore"
+    end
+    if T.Mode == "scroll" then
+        T.CX, T.CY = TouchCentroid(T)
+        io:AddMouseSourceEvent(ImGuiMouseSource.TouchScreen)
+        io:AddMousePosEvent(T.CX, T.CY) -- wheel events go to the window under the pan
+    end
+end
+
+local function TouchMoved(id, x, y)
+    local bd = ImGui_ImplLOVE_GetBackendData()
+    local T, io = bd.Touch, ImGui.GetIO()
+    local p = T.Points[id]
+    if not p then return end
+    p.X, p.Y = x, y
+    local mode = T.Mode
+    if mode == "tap" or mode == "held" then
+        if not T.Moved then
+            local dx, dy = x - T.StartX, y - T.StartY
+            if dx * dx + dy * dy > TAP_SLOP * TAP_SLOP then T.Moved = true end
+        end
+        io:AddMouseSourceEvent(ImGuiMouseSource.TouchScreen)
+        io:AddMousePosEvent(x, y)
+    elseif mode == "scroll" then
+        local cx, cy = TouchCentroid(T)
+        local g = ImGui.GetCurrentContext()
+        local font_px = (g and g.FontSize > 0) and g.FontSize or 13
+        -- one wheel notch scrolls ~5 lines of text: dragging content with the fingers = wheel in the drag direction
+        local wx, wy = (cx - T.CX) / (5 * font_px), (cy - T.CY) / (5 * font_px)
+        T.CX, T.CY = cx, cy
+        io:AddMouseSourceEvent(ImGuiMouseSource.TouchScreen)
+        io:AddMousePosEvent(cx, cy)
+        if wx ~= 0 or wy ~= 0 then io:AddMouseWheelEvent(wx, wy) end
+    end
+end
+
+local function TouchReleased(id, x, y)
+    local bd = ImGui_ImplLOVE_GetBackendData()
+    local T, io = bd.Touch, ImGui.GetIO()
+    if not T.Points[id] then return end
+    T.Points[id] = nil
+    T.Count = T.Count - 1
+    io:AddMouseSourceEvent(ImGuiMouseSource.TouchScreen)
+    if T.Count == 0 then
+        local mode = T.Mode
+        T.Mode = "none"
+        if mode == "tap" then
+            io:AddMousePosEvent(x, y)
+            io:AddMouseButtonEvent(0, false)
+            T.LeftDown = false
+        elseif mode == "held" and T.RightDown then
+            io:AddMouseButtonEvent(1, false)
+            T.RightDown = false
+        end
+        -- no finger = no hover (tooltips, highlights); the next mouse movement brings the real position back
+        io:AddMousePosEvent(-FLT_MAX, -FLT_MAX)
+    elseif T.Mode == "scroll" and T.Count < 2 then
+        T.Mode = "ignore" -- the remaining finger must not turn into a click / jump
+    elseif T.Mode == "scroll" then
+        T.CX, T.CY = TouchCentroid(T)
+    end
+end
+
+-- Per frame: long press -> right click
+local function TouchUpdate(bd, io, now)
+    local T = bd.Touch
+    if T.Mode ~= "tap" or T.Moved or not T.LongPress then return end
+    if now - T.StartTime < T.LongPress or not (T.OverUI or io.WantCaptureMouse) then return end
+    T.Mode = "held"
+    -- cancel the left press without a click, then right button down + up at the same spot (a context menu opens on
+    -- the release)
+    io:AddMouseSourceEvent(ImGuiMouseSource.TouchScreen)
+    io:AddMousePosEvent(-FLT_MAX, -FLT_MAX)
+    io:AddMouseButtonEvent(0, false)
+    io:AddMousePosEvent(T.StartX, T.StartY)
+    io:AddMouseButtonEvent(1, true)
+    io:AddMouseButtonEvent(1, false)
+    T.LeftDown, T.RightDown = false, false
+end
+
+--- Touch options: { LongPress = seconds | false (right click on long press, default 0.5), Scroll = bool (two finger pan, default true) }
+local function SetTouchOptions(opts)
+    local T = ImGui_ImplLOVE_GetBackendData().Touch
+    if opts.LongPress ~= nil then T.LongPress = opts.LongPress end
+    if opts.Scroll ~= nil then T.Scroll = opts.Scroll end
+end
+
+--- true on Android / iOS
+local function IsMobile()
+    local os_name = love.system.getOS()
+    return os_name == "Android" or os_name == "iOS"
+end
+
+--- Finger sized UI. `scale` multiplies sizes AND fonts (default: 1 on desktop, a density based guess on mobile: LÖVE
+--- reports windows in pixels unless t.window.highdpi is set, so a 13px font is tiny on a phone). Call once after
+--- CreateContext (before loading extra fonts), and again only if you want a different scale.
+--- Also: windows move only by their title bar (a finger on content never drags a window) and no 1-2px resize borders.
+local function SetupTouchStyle(scale, extra_padding)
+    local io, style = ImGui.GetIO(), ImGui.GetStyle()
+    if not scale then
+        if IsMobile() then
+            local w, h = love.graphics.getDimensions()
+            local dpi = love.window and love.window.getDPIScale and love.window.getDPIScale() or 1
+            scale = (dpi > 1) and dpi or math.max(1, math.min(3.5, math.min(w, h) / 420)) -- ~420px short side = 1x
+        else
+            scale = 1
+        end
+    end
+    style:ScaleAllSizes(scale)
+    style.FontScaleMain = scale
+    local e = (extra_padding or 6) * scale
+    style.TouchExtraPadding = ImVec2(e, e)
+    style.ScrollbarSize = math.max(style.ScrollbarSize, 20 * scale)
+    style.GrabMinSize = math.max(style.GrabMinSize, 20 * scale)
+    io.ConfigWindowsMoveFromTitleBarOnly = true
+    io.ConfigWindowsResizeFromEdges = false -- the corner grip stays; fingers can't hit thin borders
+    return scale
 end
 
 ---------------------------------------------------------
@@ -445,11 +639,13 @@ end
 function ImGui_ImplLOVE_Init(opts)
     opts = opts or {}
     local io = ImGui.GetIO()
-    local bd = { Time = love.timer.getTime(), Root = opts.root or "", Textures = {}, TextureCount = 0, Meshes = {}, FrameNo = 0 }
+    local cursors = not (love.mouse.isCursorSupported and not love.mouse.isCursorSupported())
+    local bd = { CursorsSupported = cursors, Time = love.timer.getTime(), Root = opts.root or "", Textures = {}, TextureCount = 0, Meshes = {}, FrameNo = 0, Touch = NewTouchState() }
     io.BackendPlatformUserData = bd
     io.BackendPlatformName = "imgui_impl_love"
     io.BackendRendererName = "imgui_impl_love"
-    io.BackendFlags = bit32.bor(io.BackendFlags, ImGuiBackendFlags.RendererHasTextures, ImGuiBackendFlags.RendererHasVtxOffset, ImGuiBackendFlags.HasMouseCursors)
+    io.BackendFlags = bit32.bor(io.BackendFlags, ImGuiBackendFlags.RendererHasTextures, ImGuiBackendFlags.RendererHasVtxOffset)
+    if cursors then io.BackendFlags = bit32.bor(io.BackendFlags, ImGuiBackendFlags.HasMouseCursors) end
 
     local platform_io = ImGui.GetPlatformIO()
     platform_io.Platform_SetImeDataFn       = PlatformSetImeData
@@ -483,8 +679,10 @@ function ImGui_ImplLOVE_NewFrame()
     local now = love.timer.getTime()
     io.DeltaTime = (now > bd.Time) and (now - bd.Time) or (1.0 / 60.0)
     bd.Time = now
+    TouchUpdate(bd, io, now)
 
-    if bit32.band(io.ConfigFlags, ImGuiConfigFlags.NoMouseCursorChange) == 0 then
+    -- (no system cursors on Android / iOS: love.mouse.getSystemCursor would error there)
+    if bd.CursorsSupported and bit32.band(io.ConfigFlags, ImGuiConfigFlags.NoMouseCursorChange) == 0 then
         local cursor = ImGui.GetMouseCursor()
         if cursor ~= bd.LastCursor then
             bd.LastCursor = cursor
@@ -501,16 +699,21 @@ end
 
 local MOUSE_BUTTONS = { [1] = 0, [2] = 1, [3] = 2, [4] = 3, [5] = 4 } -- LÖVE: 1 left, 2 right, 3 middle
 
-local function MouseMoved(x, y)
+-- `istouch` (LÖVE's 4th argument on mouse callbacks): the first finger is also reported as a mouse event. Those are
+-- ignored: the touchpressed / touchmoved / touchreleased callbacks carry every finger.
+local function MouseMoved(x, y, dx, dy, istouch)
+    if istouch then return end
     local io = ImGui.GetIO()
     io:AddMouseSourceEvent(ImGuiMouseSource.Mouse)
     io:AddMousePosEvent(x, y)
 end
-local function MousePressed(x, y, button)
+local function MousePressed(x, y, button, istouch)
+    if istouch then return end
     local b = MOUSE_BUTTONS[button]
     if b then local io = ImGui.GetIO(); io:AddMouseSourceEvent(ImGuiMouseSource.Mouse); io:AddMouseButtonEvent(b, true) end
 end
-local function MouseReleased(x, y, button)
+local function MouseReleased(x, y, button, istouch)
+    if istouch then return end
     local b = MOUSE_BUTTONS[button]
     if b then ImGui.GetIO():AddMouseButtonEvent(b, false) end
 end
@@ -529,6 +732,10 @@ local function TextInput(text)
     local io = ImGui.GetIO()
     for _, c in utf8.codes(text) do io:AddInputCharacter(c) end
 end
+-- love.touchpressed(id, x, y, dx, dy, pressure) etc.: x, y in window units, like the mouse
+local function TouchPressedCb(id, x, y) TouchPressed(id, x, y) end
+local function TouchMovedCb(id, x, y) TouchMoved(id, x, y) end
+local function TouchReleasedCb(id, x, y) TouchReleased(id, x, y) end
 local function Focus(f) ImGui.GetIO():AddFocusEvent(f) end
 
 --- True when ImGui wants the mouse / keyboard (don't pass the event to your game)
@@ -547,6 +754,12 @@ ImGui_ImplLove = {
     MouseMoved     = MouseMoved,
     MousePressed   = MousePressed,
     MouseReleased  = MouseReleased,
+    TouchPressed   = TouchPressedCb,
+    TouchMoved     = TouchMovedCb,
+    TouchReleased  = TouchReleasedCb,
+    SetTouchOptions = SetTouchOptions,
+    SetupTouchStyle = SetupTouchStyle,
+    IsMobile       = IsMobile,
     WheelMoved     = WheelMoved,
     KeyPressed     = KeyPressed,
     KeyReleased    = KeyReleased,

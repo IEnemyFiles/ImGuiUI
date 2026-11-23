@@ -20,6 +20,6 @@ love = {
     data = { newByteData = function(n) return bytedata(n) end },
     keyboard = { isDown = function() return false end, setTextInput = function() end, setKeyRepeat = function() end },
     mouse = { setCursor = function() end, getSystemCursor = function() return {} end, setVisible = function() end },
-    system = { getClipboardText = function() return "" end, setClipboardText = function() end, openURL = function() end },
+    system = { getOS = function() return "Android" end, getClipboardText = function() return "" end, setClipboardText = function() end, openURL = function() end },
     filesystem = { getInfo = function() return nil end, read = function() return nil end },
 }
