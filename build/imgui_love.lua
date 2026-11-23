@@ -14790,7 +14790,8 @@ function ImGui.EndFrame()
         -- [Port] IMGUI_DEBUG_LOG_IO("[io] Calling Platform_SetImeDataFn(): WantVisible: %d, InputPos (%.2f,%.2f) for Viewport 0x%08X", ime_data.WantVisible, ime_data.InputPos.x, ime_data.InputPos.y, viewport.ID)
         g.PlatformIO.Platform_SetImeDataFn(g, viewport, ime_data)
     end
-    g.WantTextInputNextFrame = ime_data.WantTextInput
+    -- [Port] C++ stores an int (0/1); a Lua boolean would make `false ~= 0` true and io.WantTextInput permanently true
+    g.WantTextInputNextFrame = (ime_data.WantTextInput == true or ime_data.WantTextInput == 1) and 1 or 0
 
     -- Hide implicit/fallback "Debug" window if it hasn't been used
     g.WithinFrameScopeWithImplicitWindow = false
